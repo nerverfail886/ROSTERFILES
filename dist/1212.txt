@@ -1,0 +1,1177 @@
+' Variants claim on the top
+Private monday As Object
+Private mondayAM As Object
+Private mondayPM As Object
+Private AL As Object
+Private RDO As Object
+Private WC As Object
+
+Option Explicit
+
+
+Function GetTaskSkillGroups(dbPath As String, ByRef taskDict As Object, ByRef taskRequiredDict As Object) As Boolean
+    ' Define variables
+    Dim conn As Object
+    Dim rs As Object
+    Dim staffDict As Object  'dicts to store info of each task
+
+    On Error Resume Next  ' start handle errors
+
+    ' Initialize result
+    GetTaskSkillGroups = False
+
+    ' Create objects with error checking
+    Set conn = CreateObject("ADODB.Connection")
+    If Err.Number <> 0 Then
+        MsgBox "Error creating database connection: " & Err.Description
+        Exit Function
+    End If
+
+    Set taskDict = CreateObject("Scripting.Dictionary")
+    If Err.Number <> 0 Then
+        MsgBox "Error creating taskDict: " & Err.Description
+        Exit Function
+    End If
+
+    Set taskRequiredDict = CreateObject("Scripting.Dictionary")
+    If Err.Number <> 0 Then
+        MsgBox "Error creating taskRequiredDict: " & Err.Description
+        Exit Function
+    End If
+
+    ' Open the connection
+    conn.Open "Provider=Microsoft.ACE.OLEDB.12.0;Data Source=" & dbPath
+    If Err.Number <> 0 Then
+        MsgBox "Error connecting to database: " & Err.Description & vbCrLf & _
+               "Please check if Microsoft Access Database Engine is installed."
+        GoTo Cleanup
+    End If
+
+    ' Create recordset
+    Set rs = CreateObject("ADODB.Recordset")
+    If Err.Number <> 0 Then
+        MsgBox "Error creating recordset: " & Err.Description
+        GoTo Cleanup
+    End If
+
+    ' Execute query
+    rs.Open "SELECT t.TaskID, t.TaskName, t.RequiredPeople, p.StaffID, p.StaffName, p.SkillScore " & _
+           "FROM Tasks t " & _
+           "INNER JOIN peopleSkills p ON t.TaskID = p.TaskID " & _
+           "ORDER BY p.TaskID, p.SkillScore DESC", conn, 1, 1
+
+    If Err.Number <> 0 Then
+        MsgBox "Error executing query: " & Err.Description & vbCrLf & _
+               "SQL Error Code: " & Err.Number
+        GoTo Cleanup
+    End If
+
+    On Error GoTo 0  ' close error handling
+
+    ' Process recordset
+    Do While Not rs.EOF
+        Dim taskID As Long
+        Dim staffID As String
+        Dim staffData As String
+
+        taskID = rs.Fields("TaskID").Value
+        staffID = CStr(rs.Fields("StaffID").Value)
+
+        ' Store required people if not already stored
+        If Not taskRequiredDict.Exists(taskID) Then
+            taskRequiredDict.Add taskID, rs.Fields("RequiredPeople").Value
+        End If
+
+        ' Create staff data string
+        staffData = rs.Fields("StaffName").Value & "|" & _
+                   rs.Fields("SkillScore").Value
+
+        ' Create new Dictionary for task if not exists
+        If Not taskDict.Exists(taskID) Then
+            Set staffDict = CreateObject("Scripting.Dictionary")
+            taskDict.Add taskID, staffDict
+        End If
+
+        ' Add or update staff data to task's staff dictionary
+        If Not taskDict(taskID).Exists(staffID) Then
+            taskDict(taskID).Add staffID, staffData
+        Else
+            taskDict(taskID)(staffID) = staffData
+        End If
+
+        rs.MoveNext
+    Loop
+
+    ' Set success flag
+    GetTaskSkillGroups = True
+
+Cleanup:
+    ' Clean up objects
+    If Not rs Is Nothing Then
+        If rs.State = 1 Then rs.Close  ' 1 = adStateOpen
+        Set rs = Nothing
+    End If
+
+    If Not conn Is Nothing Then
+        If conn.State = 1 Then conn.Close  ' 1 = adStateOpen
+        Set conn = Nothing
+    End If
+End Function
+
+
+Sub ProcessRosterSheet(ws As Worksheet, M As Object, AM As Object, PM As Object, _
+                      AL As Object, RDO As Object, WC As Object)
+    Dim currentRow As Long
+    Dim ID As String, name As String, timeStr As String
+    Dim startHour As Integer
+    Dim scheduleStr As String
+    
+    currentRow = 4  ' roster sheet start at row 4
+'    Debug.Print "Processing roster sheet"
+    
+    Do While currentRow <= ws.UsedRange.Rows.Count
+        ' check if roster sheet reach its bottom
+        If Not IsEmpty(ws.Cells(currentRow, "B").Value) And _
+           UCase(Trim(ws.Cells(currentRow, "B").Value)) = "BCR" Then
+'            Debug.Print "Found BCR section at row " & currentRow & ". Stopping roster processing."
+            Exit Sub
+        End If
+
+        ID = CStr(ws.Cells(currentRow, "A").Value)
+        name = ws.Cells(currentRow, "B").Value
+        timeStr = ws.Cells(currentRow, "F").Value
+
+        If Not IsEmpty(timeStr) Then
+            If IsNumeric(ID) Or Left(ID, 4) = "INAC" Or _
+               InStr(1, ID, "Programmed") > 0 Then
+               
+                scheduleStr = name & "|" & timeStr & "|1"  ' 1 means gategourmet staff
+
+                ' assign staff on differnt timeStrs
+                Select Case UCase(Trim(timeStr))
+                    Case "AL"
+                        If Not AL.Exists(ID) Then
+                            AL.Add ID, scheduleStr
+                        End If
+                    
+                    Case "RDO"
+                        If Not RDO.Exists(ID) Then
+                            RDO.Add ID, scheduleStr
+                        End If
+                    
+                    Case "WCOMP", "SL"
+                        If Not WC.Exists(ID) Then
+                            WC.Add ID, scheduleStr
+                        End If
+                    
+                    Case Else  ' dealing with regular timeStr: eg 06:00-14:00
+                        If Not M.Exists(ID) Then
+                            M.Add ID, scheduleStr
+
+                            If InStr(timeStr, "-") > 0 Then
+                                startHour = CInt(Split(Split(timeStr, "-")(0), ":")(0))
+                                
+                                If startHour < 12 Then
+                                    If Not AM.Exists(ID) Then AM.Add ID, scheduleStr
+                                Else
+                                    If Not PM.Exists(ID) Then PM.Add ID, scheduleStr
+                                End If
+                            End If
+                        End If
+                End Select
+            End If
+        End If
+
+        currentRow = currentRow + 1
+    Loop
+End Sub
+
+Sub ProcessBCRSheet(ws As Worksheet, monday As Object, mondayAM As Object, mondayPM As Object)
+    Dim currentRow As Long
+    Dim ID As String, name As String, timeStr As String
+    Dim startHour As Integer
+    Dim scheduleStr As String
+    
+    currentRow = 3  ' BCR sheet start at row 3
+'    Debug.Print "Processing BCR sheet"
+    
+    Do While currentRow <= ws.UsedRange.Rows.Count
+        If UCase(Trim(ws.Cells(currentRow, "A").Value)) = "END" Then
+            Debug.Print "Found END at row: " & currentRow
+            Exit Do
+        End If
+        ID = CStr(ws.Cells(currentRow, "A").Value)
+        name = ws.Cells(currentRow, "B").Value
+        timeStr = ws.Cells(currentRow, "F").Value  ' Monday's colum
+
+        If Not IsEmpty(timeStr) And timeStr <> "NA" Then
+            If IsNumeric(ID) Or Left(ID, 4) = "INAC" Or InStr(1, ID, "Programmed") > 0 Then
+                scheduleStr = name & "|" & timeStr & "|2"  ' 2 means Bluecollar staff or other agency
+
+                If Not monday.Exists(ID) Then
+                    monday.Add ID, scheduleStr
+
+                    If InStr(timeStr, "-") > 0 Then
+                        startHour = CInt(Split(Split(timeStr, "-")(0), ":")(0))
+                        
+                        If startHour < 12 Then
+                            If Not mondayAM.Exists(ID) Then mondayAM.Add ID, scheduleStr
+                        Else
+                            If Not mondayPM.Exists(ID) Then mondayPM.Add ID, scheduleStr
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        currentRow = currentRow + 1
+    Loop
+End Sub
+
+
+Sub PrintDictionary(dict As Object)
+    Dim key As Variant
+    For Each key In dict.Keys
+        Debug.Print key & " => " & dict(key)
+    Next key
+End Sub
+
+
+Sub ProcessSchedule()
+    ' initialise dicts of diffent pools, as in the whole day pool, AM pool and Pm pool
+    Set monday = CreateObject("Scripting.Dictionary")
+    Set mondayAM = CreateObject("Scripting.Dictionary")
+    Set mondayPM = CreateObject("Scripting.Dictionary")
+    
+        ' special status dicts
+    Set AL = CreateObject("Scripting.Dictionary")
+    Set RDO = CreateObject("Scripting.Dictionary")
+    Set WC = CreateObject("Scripting.Dictionary")
+
+    ' process roster sheet
+    Dim wsRoster As Worksheet
+    Set wsRoster = ThisWorkbook.Sheets("roster")
+    Call ProcessRosterSheet(wsRoster, monday, mondayAM, mondayPM, AL, RDO, WC)
+
+    ' process BCR sheet
+    Dim wsBCR As Worksheet
+    Set wsBCR = ThisWorkbook.Sheets("BCR")
+    Call ProcessBCRSheet(wsBCR, monday, mondayAM, mondayPM)
+
+    ' print results on immediate window
+'    Debug.Print "=== Monday Collection ==="
+'    PrintDictionary monday
+'
+'    Debug.Print vbNewLine & "=== Monday AM Collection ==="
+'    PrintDictionary mondayAM
+
+'    Debug.Print vbNewLine & "=== Monday PM Collection ==="
+'    PrintDictionary mondayPM
+
+'    Debug.Print vbNewLine & "=== AL Collection ==="
+'    PrintDictionary AL
+
+'    Debug.Print vbNewLine & "=== RDO Collection ==="
+'    PrintDictionary RDO
+
+'    Debug.Print vbNewLine & "=== WCOMP Collection ==="
+'    PrintDictionary WC
+End Sub
+
+Sub FilterTaskStaffByAMSchedule(ByRef taskDict As Object, ByRef mondayAM As Object)
+     'loop each task
+    Dim taskID As Variant
+    Dim staffDict As Object
+    Dim staffID As Variant
+    Dim staffToRemove As Collection
+
+    For Each taskID In taskDict.Keys
+        Set staffDict = taskDict(taskID)
+        Set staffToRemove = New Collection
+
+'         see if staff's in AM pool
+        For Each staffID In staffDict.Keys
+'             if not add it to staffToRemove dicts, to be removed
+            If Not mondayAM.Exists(staffID) Then
+                staffToRemove.Add staffID
+            End If
+        Next staffID
+
+'         remove not-in-AM-pool staff
+        Dim removeID As Variant
+        For Each removeID In staffToRemove
+            staffDict.Remove removeID
+        Next removeID
+    Next taskID
+End Sub
+
+Function AssignAMTasks(ByRef taskDict As Object, ByRef taskRequiredDict As Object, ByRef mondayAM As Object) As Object
+    ' variants claim
+    Dim taskSequence As Variant
+    Dim assignedStaff As Object
+    Dim taskAssignments As Object
+    Dim taskID As Variant
+    Dim staffDict As Object
+    Dim staffID As Variant
+    Dim requiredPeople As Long
+    Dim assignedCount As Long
+    Dim currentTaskAssignments As Object
+    
+    ' initialisation
+    taskSequence = Array(26, 27, 28, 19, 18, 17, 14, 15, 16, 4, 6, 7, 8, 3, 5, 2, 1, 9, 20, 10, 13)
+    Set assignedStaff = CreateObject("Scripting.Dictionary")
+    Set taskAssignments = CreateObject("Scripting.Dictionary")
+
+    ' process of assigning staff to each task
+    For Each taskID In taskSequence
+        requiredPeople = taskRequiredDict(taskID)
+        Set staffDict = taskDict(taskID)
+        Set currentTaskAssignments = CreateObject("Scripting.Dictionary")
+        
+        assignedCount = 0
+        For Each staffID In staffDict.Keys
+            If Not assignedStaff.Exists(staffID) Then
+                currentTaskAssignments.Add staffID, mondayAM(staffID)
+                assignedStaff.Add staffID, True
+                assignedCount = assignedCount + 1
+                If assignedCount >= requiredPeople Then Exit For
+            End If
+        Next staffID
+        
+        If currentTaskAssignments.Count > 0 Then
+            taskAssignments.Add taskID, currentTaskAssignments
+        End If
+    Next taskID
+    
+    ' put unassgined staff in the taskId 100
+    Set currentTaskAssignments = CreateObject("Scripting.Dictionary")
+    
+    For Each staffID In mondayAM.Keys
+        
+        If Not assignedStaff.Exists(staffID) Then
+            currentTaskAssignments.Add staffID, mondayAM(staffID)
+        End If
+    Next staffID
+    
+    If currentTaskAssignments.Count > 0 Then
+        taskAssignments.Add "100", currentTaskAssignments
+    End If
+    
+    Set AssignAMTasks = taskAssignments
+    Set assignedStaff = Nothing
+End Function
+
+' rerurn dicts of am tasks assignments
+Function TestAssignAMTasks() As Object
+    Dim taskDict As Object
+    Dim taskRequiredDict As Object
+    Dim amAssignments As Object
+
+    ' abtain tasks and people skills info from the database
+    If GetTaskSkillGroups("C:\Users\戴尔5580\Desktop\RosterDatabase.accdb", taskDict, taskRequiredDict) Then
+        ' get am staff pool
+        Call ProcessSchedule
+
+        ' filter task staff
+        Call FilterTaskStaffByAMSchedule(taskDict, mondayAM)
+
+        ' process the assignment and get the results
+        Set amAssignments = AssignAMTasks(taskDict, taskRequiredDict, mondayAM)
+        
+        ' return the assignment results
+        Set TestAssignAMTasks = amAssignments
+    End If
+End Function
+
+
+Sub FilterTaskStaffByPMSchedule(ByRef taskDict As Object, ByRef mondayPM As Object)
+    ' loop each pm tasks
+    Dim taskID As Variant
+    Dim staffDict As Object
+    Dim staffID As Variant
+    Dim staffToRemove As Collection
+
+    For Each taskID In taskDict.Keys
+        Set staffDict = taskDict(taskID)
+        Set staffToRemove = New Collection
+
+        ' see if the staff's in pm pool
+        For Each staffID In staffDict.Keys
+            ' if not in the pool, add it in staffToRemove
+            If Not mondayPM.Exists(staffID) Then
+                staffToRemove.Add staffID
+            End If
+        Next staffID
+
+        ' remove the not-in-pool staff
+        Dim removeID As Variant
+        For Each removeID In staffToRemove
+            staffDict.Remove removeID
+        Next removeID
+    Next taskID
+End Sub
+
+Function AssignPMTasks(ByRef taskDict As Object, ByRef taskRequiredDict As Object, ByRef mondayPM As Object) As Object
+    ' variants claim
+    Dim taskSequence As Variant
+    Dim assignedStaff As Object
+    Dim taskAssignments As Object
+    Dim taskID As Variant
+    Dim staffDict As Object
+    Dim staffID As Variant
+    Dim requiredPeople As Long
+    Dim assignedCount As Long
+    Dim currentTaskAssignments As Object
+    
+    ' initialisation
+    taskSequence = Array(11, 21, 22, 25, 24, 23, 31)
+    Set assignedStaff = CreateObject("Scripting.Dictionary")
+    Set taskAssignments = CreateObject("Scripting.Dictionary")
+
+    ' process of assigning the pm staff
+    For Each taskID In taskSequence
+        requiredPeople = taskRequiredDict(taskID)
+        Set staffDict = taskDict(taskID)
+        Set currentTaskAssignments = CreateObject("Scripting.Dictionary")
+        
+        assignedCount = 0
+        For Each staffID In staffDict.Keys
+            If Not assignedStaff.Exists(staffID) Then
+                currentTaskAssignments.Add staffID, mondayPM(staffID)
+                assignedStaff.Add staffID, True
+                assignedCount = assignedCount + 1
+                If assignedCount >= requiredPeople Then Exit For
+            End If
+        Next staffID
+        
+        If currentTaskAssignments.Count > 0 Then
+            taskAssignments.Add taskID, currentTaskAssignments
+        End If
+    Next taskID
+    
+    ' put the assigned staff under key 101
+    Set currentTaskAssignments = CreateObject("Scripting.Dictionary")
+    For Each staffID In mondayPM.Keys
+        If Not assignedStaff.Exists(staffID) Then
+            currentTaskAssignments.Add staffID, mondayPM(staffID)
+        End If
+    Next staffID
+    
+    If currentTaskAssignments.Count > 0 Then
+        taskAssignments.Add "101", currentTaskAssignments
+    End If
+    
+    Set AssignPMTasks = taskAssignments
+    Set assignedStaff = Nothing
+End Function
+
+' return the pm assignment dict
+Function TestAssignPMTasks() As Object
+    Dim taskDict As Object
+    Dim taskRequiredDict As Object
+    Dim pmAssignments As Object
+
+    ' obtain tasks and people skills info
+    If GetTaskSkillGroups("C:\Users\戴尔5580\Desktop\RosterDatabase.accdb", taskDict, taskRequiredDict) Then
+        ' get the pm pool
+        Call ProcessSchedule
+
+        ' filter pm task staff
+        Call FilterTaskStaffByPMSchedule(taskDict, mondayPM)
+
+        ' process the asssignment and get the results
+        Set pmAssignments = AssignPMTasks(taskDict, taskRequiredDict, mondayPM)
+        
+        ' return the assignmen results
+        Set TestAssignPMTasks = pmAssignments
+    End If
+End Function
+
+' prints to check the assignments
+Sub UseTaskAssignments()
+    Dim amResults As Object
+    Dim pmResults As Object
+
+    Set amResults = TestAssignAMTasks()
+    Set pmResults = TestAssignPMTasks()
+
+    ' AM Assignments
+    Debug.Print "=== AM Assignments ==="
+    Dim taskID As Variant
+    For Each taskID In amResults.Keys
+        If taskID <> "100" Then  ' regular tasks
+            Debug.Print "Task " & taskID
+            Dim staffID As Variant
+            For Each staffID In amResults(taskID).Keys
+                Debug.Print "  Staff " & staffID & ": " & amResults(taskID)(staffID)
+            Next staffID
+        End If
+    Next taskID
+
+    ' unassigned AM staff
+    If amResults.Exists("100") Then
+        Debug.Print "=======Unassigned AM Staff:"
+        For Each staffID In amResults("100").Keys
+            Debug.Print "  Staff " & staffID & ": " & amResults("100")(staffID)
+        Next staffID
+    End If
+
+    ' PM Assignments
+    Debug.Print vbNewLine & "=== PM Assignments ==="
+    For Each taskID In pmResults.Keys
+        If taskID <> "101" Then  ' regular tasks
+            Debug.Print "Task " & taskID
+            For Each staffID In pmResults(taskID).Keys
+                Debug.Print "  Staff " & staffID & ": " & pmResults(taskID)(staffID)
+            Next staffID
+        End If
+    Next taskID
+
+    ' unassigned PM staff
+    If pmResults.Exists("101") Then
+        Debug.Print "==========Unassigned PM Staff:"
+        For Each staffID In pmResults("101").Keys
+            Debug.Print "  Staff " & staffID & ": " & pmResults("101")(staffID)
+        Next staffID
+    End If
+End Sub
+
+Sub WritePMAssignments(ws As Worksheet, pmResults As Object)
+    ' variants claim
+    Dim taskID As Variant
+    Dim staffDict As Object
+    Dim staffID As Variant
+    Dim staffData As Variant
+    Dim sourceColor As Long
+    Dim staffCount As Long
+    
+    On Error Resume Next  ' satrt the error handling
+    
+    ' for loop each task
+    For Each taskID In pmResults.Keys
+        ' skip unassigned staff(taskID 101)
+        If taskID <> "101" Then
+            Set staffDict = pmResults(taskID)
+            staffCount = 0
+            
+            ' for loop all the staff in the task
+            For Each staffID In staffDict.Keys
+                ' split the staff data
+                staffData = Split(staffDict(staffID), "|")
+                
+                ' set color for the cell to tell the difference of staff
+                If staffData(2) = "1" Then
+                    sourceColor = RGB(217, 217, 217)  ' Roster
+                Else
+                    sourceColor = RGB(255, 242, 204)  ' BCR
+                End If
+                
+                ' put people in the right section of the sheet depending on the taskid
+                Select Case CLng(taskID)
+                    Case 11
+                        ' [PM admin]
+                        ws.Range("B" & (34 + staffCount)).Value = staffID
+                        ws.Range("B" & (34 + staffCount)).Interior.Color = sourceColor
+                        ws.Range("C" & (34 + staffCount)).Value = staffData(0)  ' name
+                        ws.Range("D" & (34 + staffCount)).Value = staffData(1)  ' time
+                        
+                    Case 21
+                        ' [shift leader]
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("L3").Value = staffID
+                                ws.Range("L3").Interior.Color = sourceColor
+                                ws.Range("M3").Value = staffData(0)
+                                ws.Range("N3").Value = staffData(1)
+                            Case 1
+                                ws.Range("L7").Value = staffID
+                                ws.Range("L7").Interior.Color = sourceColor
+                                ws.Range("M7").Value = staffData(0)
+                                ws.Range("N7").Value = staffData(1)
+                        End Select
+                        
+                    Case 22
+                        ' Task 22 [Prep UA3 AA HA SB]
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("L4").Value = staffID
+                                ws.Range("L4").Interior.Color = sourceColor
+                                ws.Range("M4").Value = staffData(0)
+                                ws.Range("N4").Value = staffData(1)
+                            Case 1
+                                ws.Range("L5").Value = staffID
+                                ws.Range("L5").Interior.Color = sourceColor
+                                ws.Range("M5").Value = staffData(0)
+                                ws.Range("N5").Value = staffData(1)
+                        End Select
+                        
+                    Case 25
+                        ' Task 25 (L24-L25) [HALAL KITCHEN]
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("L21").Value = staffID
+                                ws.Range("L21").Interior.Color = sourceColor
+                                ws.Range("M21").Value = staffData(0)
+                                ws.Range("N21").Value = staffData(1)
+                            Case 1
+                                ws.Range("L22").Value = staffID
+                                ws.Range("L22").Interior.Color = sourceColor
+                                ws.Range("M22").Value = staffData(0)
+                                ws.Range("N22").Value = staffData(1)
+                        End Select
+                        
+                    Case 24
+                        ' Task 24 (L17-L21) [SPML]
+                        If staffCount < 5 Then
+                            ws.Range("L" & (15 + staffCount)).Value = staffID
+                            ws.Range("L" & (15 + staffCount)).Interior.Color = sourceColor
+                            ws.Range("M" & (15 + staffCount)).Value = staffData(0)
+                            ws.Range("N" & (15 + staffCount)).Value = staffData(1)
+                        End If
+                        
+                    Case 23
+                        ' Task 23 (L8-L14) [SW]
+                        If staffCount < 7 Then
+                            ws.Range("L" & (8 + staffCount)).Value = staffID
+                            ws.Range("L" & (8 + staffCount)).Interior.Color = sourceColor
+                            ws.Range("M" & (8 + staffCount)).Value = staffData(0)
+                            ws.Range("N" & (8 + staffCount)).Value = staffData(1)
+                        End If
+                    Case 31
+                        ' Task 31 [TT PREP]
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("L26").Value = staffID
+                                ws.Range("L26").Interior.Color = sourceColor
+                                ws.Range("M26").Value = staffData(0)
+                                ws.Range("N26").Value = staffData(1)
+                            Case 1
+                                ws.Range("L27").Value = staffID
+                                ws.Range("L27").Interior.Color = sourceColor
+                                ws.Range("M27").Value = staffData(0)
+                                ws.Range("N27").Value = staffData(1)
+                        End Select
+                End Select
+                
+                staffCount = staffCount + 1
+            Next staffID
+        End If
+    Next taskID
+    
+    ' unassigned staff
+    If pmResults.Exists("101") Then
+        ' add the title for Unassigned Staff
+        ws.Range("M32").Value = "Unassigned Staff"
+        ws.Range("M32").Interior.Color = RGB(255, 0, 0)  ' red background
+        
+        ' obtain dict of unassined staff
+        Set staffDict = pmResults("101")
+        staffCount = 0
+        
+        ' loop unassined staff
+        For Each staffID In staffDict.Keys
+            ' split data of unassigned staff
+            staffData = Split(staffDict(staffID), "|")
+            
+            ' color to differentiate the staff
+            If staffData(2) = "1" Then
+                sourceColor = RGB(217, 217, 217)  ' Roster
+            Else
+                sourceColor = RGB(255, 242, 204)  ' BCR
+            End If
+            
+            ' 从L28开始填写未分配员工
+            ws.Range("L" & (33 + staffCount)).Value = staffID
+            ws.Range("L" & (33 + staffCount)).Interior.Color = sourceColor
+            ws.Range("M" & (33 + staffCount)).Value = staffData(0)  ' name
+            ws.Range("N" & (33 + staffCount)).Value = staffData(1)  ' time
+            
+            staffCount = staffCount + 1
+        Next staffID
+    End If
+    
+    On Error GoTo 0  ' close error handling
+End Sub
+
+'' TestWritePMAssignments
+'Sub TestWritePMAssignments()
+'    Dim ws As Worksheet
+'    Dim pmResults As Object
+'
+'    ' set the working sheet
+'    Set ws = ThisWorkbook.Sheets("Monday")
+'
+'    ' get the pm assignment results
+'    Set pmResults = TestAssignPMTasks()
+'
+'    ' 写入结果到工作表
+'    Call WritePMAssignments(ws, pmResults)
+'End Sub
+
+Sub WriteAMAssignments(ws As Worksheet, amResults As Object)
+    ' variant claim
+    Dim taskID As Variant
+    Dim staffDict As Object
+    Dim staffID As Variant
+    Dim staffData As Variant
+    Dim sourceColor As Long
+    Dim staffCount As Long
+    
+    On Error Resume Next  ' start error handling
+
+    
+    ' loop each task
+    For Each taskID In amResults.Keys
+        ' skip the unassigned staff
+        If taskID <> "100" Then
+            Set staffDict = amResults(taskID)
+            staffCount = 0
+            
+            ' loop the staff
+            For Each staffID In staffDict.Keys
+                ' split the info
+                staffData = Split(staffDict(staffID), "|")
+                
+                ' color to differentiate the staff
+                If staffData(2) = "1" Then
+                    sourceColor = RGB(217, 217, 217)  ' Roster
+                Else
+                    sourceColor = RGB(255, 242, 204)  ' BCR
+                End If
+                
+                ' put people in the right section of the sheet depending on the taskid
+                Select Case CLng(taskID)
+                    Case 26
+                        ws.Range("B26").Value = staffID
+                        ws.Range("B26").Interior.Color = sourceColor
+                        ws.Range("C26").Value = staffData(0)  ' name
+                        ws.Range("D26").Value = staffData(1)  ' time
+                        
+                    Case 27
+                        ws.Range("B27").Value = staffID
+                        ws.Range("B27").Interior.Color = sourceColor
+                        ws.Range("C27").Value = staffData(0)
+                        ws.Range("D27").Value = staffData(1)
+                        
+                    Case 28
+                        ws.Range("B29").Value = staffID
+                        ws.Range("B29").Interior.Color = sourceColor
+                        ws.Range("C29").Value = staffData(0)
+                        ws.Range("D29").Value = staffData(1)
+                        
+                    'Case 29
+                        'ws.Range("B31").Value = staffID
+                        'ws.Range("B31").Interior.Color = sourceColor
+                        'ws.Range("C31").Value = staffData(0)
+                        'ws.Range("D31").Value = staffData(1)
+                        
+                    'Case 30
+                        'ws.Range("B32").Value = staffID
+                        'ws.Range("B32").Interior.Color = sourceColor
+                        'ws.Range("C32").Value = staffData(0)
+                        'ws.Range("D32").Value = staffData(1)
+                        
+                    Case 19   'runner
+                        ws.Range("G18").Value = staffID
+                        ws.Range("G18").Interior.Color = sourceColor
+                        ws.Range("H18").Value = staffData(0)
+                        ws.Range("I18").Value = staffData(1)
+                        
+                    Case 18  'cooking
+                        ws.Range("G17").Value = staffID
+                        ws.Range("G17").Interior.Color = sourceColor
+                        ws.Range("H17").Value = staffData(0)
+                        ws.Range("I17").Value = staffData(1)
+                        
+                    Case 17  'dressing
+                        ws.Range("G16").Value = staffID
+                        ws.Range("G16").Interior.Color = sourceColor
+                        ws.Range("H16").Value = staffData(0)
+                        ws.Range("I16").Value = staffData(1)
+                        
+                    Case 14  'protein
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("G4").Value = staffID
+                                ws.Range("G4").Interior.Color = sourceColor
+                                ws.Range("H4").Value = staffData(0)
+                                ws.Range("I4").Value = staffData(1)
+                            Case 1
+                                ws.Range("G5").Value = staffID
+                                ws.Range("G5").Interior.Color = sourceColor
+                                ws.Range("H5").Value = staffData(0)
+                                ws.Range("I5").Value = staffData(1)
+                        End Select
+                        
+                    Case 15  'vege
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("G6").Value = staffID
+                                ws.Range("G6").Interior.Color = sourceColor
+                                ws.Range("H6").Value = staffData(0)
+                                ws.Range("I6").Value = staffData(1)
+                            Case 1
+                                ws.Range("G7").Value = staffID
+                                ws.Range("G7").Interior.Color = sourceColor
+                                ws.Range("H7").Value = staffData(0)
+                                ws.Range("I7").Value = staffData(1)
+                        End Select
+                        
+                    Case 16  'assembly
+                        If staffCount < 5 Then
+                            ws.Range("G" & (9 + staffCount)).Value = staffID
+                            ws.Range("G" & (9 + staffCount)).Interior.Color = sourceColor
+                            ws.Range("H" & (9 + staffCount)).Value = staffData(0)
+                            ws.Range("I" & (9 + staffCount)).Value = staffData(1)
+                        End If
+                        
+                    Case 4   'SPML-AM
+                        If staffCount < 3 Then
+                            ws.Range("B" & (10 + staffCount)).Value = staffID
+                            ws.Range("B" & (10 + staffCount)).Interior.Color = sourceColor
+                            ws.Range("C" & (10 + staffCount)).Value = staffData(0)
+                            ws.Range("D" & (10 + staffCount)).Value = staffData(1)
+                        End If
+                        
+                    Case 6   'VA
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("B19").Value = staffID
+                                ws.Range("B19").Interior.Color = sourceColor
+                                ws.Range("C19").Value = staffData(0)
+                                ws.Range("D19").Value = staffData(1)
+                            Case 1
+                                ws.Range("B20").Value = staffID
+                                ws.Range("B20").Interior.Color = sourceColor
+                                ws.Range("C20").Value = staffData(0)
+                                ws.Range("D20").Value = staffData(1)
+                        End Select
+                        
+                    Case 7  ' Cheese
+                        ws.Range("B22").Value = staffID
+                        ws.Range("B22").Interior.Color = sourceColor
+                        ws.Range("C22").Value = staffData(0)
+                        ws.Range("D22").Value = staffData(1)
+                        
+                    Case 8 'Garnish
+                        ws.Range("B23").Value = staffID
+                        ws.Range("B23").Interior.Color = sourceColor
+                        ws.Range("C23").Value = staffData(0)
+                        ws.Range("D23").Value = staffData(1)
+                        
+                    Case 3 'Garlic Bread
+                        ws.Range("B5").Value = staffID
+                        ws.Range("B5").Interior.Color = sourceColor
+                        ws.Range("C5").Value = staffData(0)
+                        ws.Range("D5").Value = staffData(1)
+                        
+                    Case 5  'SW-AM
+                        If staffCount < 3 Then
+                            ws.Range("B" & (15 + staffCount)).Value = staffID
+                            ws.Range("B" & (15 + staffCount)).Interior.Color = sourceColor
+                            ws.Range("C" & (15 + staffCount)).Value = staffData(0)
+                            ws.Range("D" & (15 + staffCount)).Value = staffData(1)
+                        End If
+                        
+                    'Case 12 'IDS
+                        'ws.Range("B39").Value = staffID
+                        'ws.Range("B39").Interior.Color = sourceColor
+                        'ws.Range("C39").Value = staffData(0)
+                        'ws.Range("D39").Value = staffData(1)
+                        
+                    Case 2
+                        ws.Range("B7").Value = staffID
+                        ws.Range("B7").Interior.Color = sourceColor
+                        ws.Range("C7").Value = staffData(0)
+                        ws.Range("D7").Value = staffData(1)
+                        
+                    Case 1
+                        'only have 2 people
+                        Select Case staffDict.Count
+                            Case 1
+                                ws.Range("B3").Value = staffID
+                                ws.Range("B3").Interior.Color = sourceColor
+                                ws.Range("C3").Value = staffData(0)
+                                ws.Range("D3").Value = staffData(1)
+                            Case 2
+                                Select Case staffCount
+                                    Case 0
+                                        ws.Range("B3").Value = staffID
+                                        ws.Range("B3").Interior.Color = sourceColor
+                                        ws.Range("C3").Value = staffData(0)
+                                        ws.Range("D3").Value = staffData(1)
+                                    Case 1
+                                        ws.Range("G3").Value = staffID
+                                        ws.Range("G3").Interior.Color = sourceColor
+                                        ws.Range("H4").Value = staffData(0)
+                                        ws.Range("I4").Value = staffData(1)
+
+                                End Select
+                        End Select
+                        
+                    Case 9
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("B6").Value = staffID
+                                ws.Range("B6").Interior.Color = sourceColor
+                                ws.Range("C6").Value = staffData(0)
+                                ws.Range("D6").Value = staffData(1)
+                            Case 1
+                                ws.Range("B25").Value = staffID
+                                ws.Range("B25").Interior.Color = sourceColor
+                                ws.Range("C25").Value = staffData(0)
+                                ws.Range("D25").Value = staffData(1)
+                        End Select
+                        
+                    Case 20    'Fruit
+                        If staffCount < 5 Then
+                            ws.Range("G" & (21 + staffCount)).Value = staffID
+                            ws.Range("G" & (21 + staffCount)).Interior.Color = sourceColor
+                            ws.Range("H" & (21 + staffCount)).Value = staffData(0)
+                            ws.Range("I" & (21 + staffCount)).Value = staffData(1)
+                        End If
+                        
+                    Case 10  ' Admin-AM
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("B32").Value = staffID
+                                ws.Range("B32").Interior.Color = sourceColor
+                                ws.Range("C32").Value = staffData(0)
+                                ws.Range("D32").Value = staffData(1)
+                            Case 1
+                                ws.Range("B33").Value = staffID
+                                ws.Range("B33").Interior.Color = sourceColor
+                                ws.Range("C33").Value = staffData(0)
+                                ws.Range("D33").Value = staffData(1)
+                        End Select
+                        
+                    Case 13   'lettuce check
+                        Select Case staffCount
+                            Case 0
+                                ws.Range("G27").Value = staffID
+                                ws.Range("G27").Interior.Color = sourceColor
+                                ws.Range("H27").Value = staffData(0)
+                                ws.Range("I27").Value = staffData(1)
+                            Case 1
+                                ws.Range("G28").Value = staffID
+                                ws.Range("G28").Interior.Color = sourceColor
+                                ws.Range("H28").Value = staffData(0)
+                                ws.Range("I28").Value = staffData(1)
+                        End Select
+                End Select
+                
+                staffCount = staffCount + 1
+            Next staffID
+        End If
+    Next taskID
+    
+    ' handle unassigned staff
+    If amResults.Exists("100") Then
+        ' add title
+        ws.Range("H29").Value = "Unassigned Staff"
+        ws.Range("H29").Interior.Color = RGB(255, 0, 0)  ' red background
+        
+        ' get dict of unassigned staff
+        Set staffDict = amResults("100")
+        staffCount = 0
+        
+        ' loop the staff in the dict
+        For Each staffID In staffDict.Keys
+            ' split the data
+            staffData = Split(staffDict(staffID), "|")
+            
+            ' set the color to staff
+            If staffData(2) = "1" Then
+                sourceColor = RGB(217, 217, 217)  ' Roster
+            Else
+                sourceColor = RGB(255, 242, 204)  ' BCR
+            End If
+            
+            ' section of unassigned staff
+            ws.Range("G" & (30 + staffCount)).Value = staffID
+            ws.Range("G" & (30 + staffCount)).Interior.Color = sourceColor
+            ws.Range("H" & (30 + staffCount)).Value = staffData(0)  ' name
+            ws.Range("I" & (30 + staffCount)).Value = staffData(1)  ' time
+            
+            staffCount = staffCount + 1
+        Next staffID
+    End If
+    
+    On Error GoTo 0  ' close the error handler
+End Sub
+
+Sub WriteSpecialStatus(ws As Worksheet)
+    Dim staffID As Variant
+    Dim staffData As Variant
+    Dim sourceColor As Long
+    Dim row As Long
+    
+    ' handle AL and RDO special case
+    row = 43
+    
+    ' write in AL
+    For Each staffID In AL.Keys
+        staffData = Split(AL(staffID), "|")
+        sourceColor = IIf(staffData(2) = "1", RGB(217, 217, 217), RGB(255, 242, 204))
+        
+        ws.Range("G" & row).Value = staffID
+        ws.Range("G" & row).Interior.Color = sourceColor
+        ws.Range("H" & row).Value = staffData(0)
+        ws.Range("H" & row).Interior.Color = RGB(255, 255, 255)  ' set white background
+        ws.Range("I" & row).Value = "AL"
+        ws.Range("I" & row).Interior.Color = RGB(255, 255, 255)  ' set white background
+        row = row + 1
+    Next staffID
+    
+    ' write in RDO
+    For Each staffID In RDO.Keys
+        staffData = Split(RDO(staffID), "|")
+        sourceColor = IIf(staffData(2) = "1", RGB(217, 217, 217), RGB(255, 242, 204))
+        
+        ws.Range("G" & row).Value = staffID
+        ws.Range("G" & row).Interior.Color = sourceColor
+        ws.Range("H" & row).Value = staffData(0)
+        ws.Range("H" & row).Interior.Color = RGB(255, 255, 255)  ' set white background
+        ws.Range("I" & row).Value = "RDO"
+        ws.Range("I" & row).Interior.Color = RGB(255, 255, 255)  ' set white background
+        
+        row = row + 1
+    Next staffID
+    
+    ' write in WC
+    row = 43
+    For Each staffID In WC.Keys
+        staffData = Split(WC(staffID), "|")
+        sourceColor = IIf(staffData(2) = "1", RGB(217, 217, 217), RGB(255, 242, 204))
+        
+        ws.Range("L" & row).Value = staffID
+        ws.Range("L" & row).Interior.Color = sourceColor
+        ws.Range("M" & row).Value = staffData(0)
+        ws.Range("M" & row).Interior.Color = RGB(255, 255, 255)  ' set white background
+        ws.Range("N" & row).Value = staffData(1)
+        ws.Range("N" & row).Interior.Color = RGB(255, 255, 255)  ' set white background
+        row = row + 1
+    Next staffID
+End Sub
+
+'' 测试函数
+'Sub TestWriteSpecialStatus()
+'    Call ProcessSchedule
+'    Call WriteSpecialStatus(ThisWorkbook.Sheets("Monday"))
+'End Sub
+
+Sub ExecuteAllTasksFour()
+    ' set the worksheet
+    Dim ws As Worksheet
+    Dim amResults As Object
+    Dim pmResults As Object
+    
+    Set ws = ThisWorkbook.Sheets("Thursday")
+    
+'    ' clear all contents
+'    Application.ScreenUpdating = False  ' screen updating turned off
+    
+    ' initialising data
+    Call ProcessSchedule
+    
+    ' get AM assignments results and write in the working sheet
+    Set amResults = TestAssignAMTasks
+    Call WriteAMAssignments(ws, amResults)
+    
+    ' get PM assignments results and write in the working sheet
+    Set pmResults = TestAssignPMTasks
+    Call WritePMAssignments(ws, pmResults)
+    
+    ' write in the special status staff
+    Call WriteSpecialStatus(ws)
+    
+'    Application.ScreenUpdating = True   ' restore the screen updating
+    
+    MsgBox "All tasks completed successfully!", vbInformation
+End Sub
+
+Sub ResetSheetFour()
+    ' variants claim
+    Dim ws As Worksheet
+    Dim response As VbMsgBoxResult
+    
+    ' yes or no msgbox
+    response = MsgBox("Are you sure you want to reset the sheet?", _
+                     vbQuestion + vbYesNo, _
+                     "Reset Confirmation")
+    
+    ' if no exit sub
+    If response = vbNo Then
+        Exit Sub
+    End If
+    
+    ' if yes continue to reset
+    Set ws = ThisWorkbook.Sheets("Thursday")
+    
+    ' BGL needs to clear the contents and change to white background
+    With ws.Range("B3:B42")
+        .ClearContents
+        .Interior.Color = RGB(255, 255, 255)
+    End With
+    
+    With ws.Range("G3:G42")
+        .ClearContents
+        .Interior.Color = RGB(255, 255, 255)
+    End With
+    
+    With ws.Range("L3:L42")
+        .ClearContents
+        .Interior.Color = RGB(255, 255, 255)
+    End With
+    
+    With ws.Range("H3:H42")
+        .ClearContents
+        .Interior.Color = RGB(255, 255, 255)
+    End With
+    With ws.Range("M3:M42")
+        .ClearContents
+        .Interior.Color = RGB(255, 255, 255)
+    End With
+    
+    With ws.Range("H43:H55")
+        .ClearContents
+        .Interior.Color = RGB(217, 217, 217)
+    End With
+    
+    With ws.Range("I43:I55")
+        .ClearContents
+        .Interior.Color = RGB(217, 217, 217)
+    End With
+    
+    With ws.Range("M43:M55")
+        .ClearContents
+        .Interior.Color = RGB(217, 217, 217)
+    End With
+    
+    With ws.Range("N43:N55")
+        .ClearContents
+        .Interior.Color = RGB(217, 217, 217)
+    End With
+    
+    
+    ' others contents clean only
+    ws.Range("C3:C42").ClearContents
+    ws.Range("D3:D42").ClearContents
+    ws.Range("H3:H42").ClearContents
+    ws.Range("I3:I42").ClearContents
+    ws.Range("M3:M42").ClearContents
+    ws.Range("N3:N42").ClearContents
+    ws.Range("G43:G55").ClearContents
+    ws.Range("L43:L55").ClearContents
+    
+    MsgBox "Reset completed!", vbInformation
+End Sub
+
+
+
+
+
+
+
+
+
